@@ -16,6 +16,11 @@ app = Flask(__name__)
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID")
 TWITCH_SECRET = os.environ.get("TWITCH_SECRET")
 TWITCH_CATEGORY = os.environ.get("TWITCH_CATEGORY", "Just Chatting")
+TWITCH_STREAM_QUALITY = os.environ.get("TWITCH_STREAM_QUALITY", "best")
+# Kobo Elipsa is 1404x1872; default to native portrait width for crisp text.
+FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
+# JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
+FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 PORT = int(os.environ.get("PORT", 5000))
 
 # Global State
@@ -121,23 +126,33 @@ def start_stream_processing(streamer_name):
                 # Don't unset current_streamer, so we can retry later via frame()
                 return
             
-            # Prefer 'worst' or '360p' for low bandwidth, or 'audio_only' if we were doing audio.
-            # But we want video for e-ink. 'worst' is usually 160p or 360p which is fine for BW.
-            # Let's try to find a balanced quality. '480p' or 'worst' usually good.
-            # Using 'worst' to ensure lowest bandwidth as requested.
-            stream_url = streams.get('worst', streams.get('360p', streams.get('best'))).url
+            # Prefer higher quality for readability on e-ink (text clarity).
+            # Allow overriding via TWITCH_STREAM_QUALITY (e.g., "best", "1080p", "720p", "worst").
+            stream_obj = streams.get(TWITCH_STREAM_QUALITY) or streams.get("best") or streams.get("720p") or streams.get("480p") or streams.get("worst")
+            if not stream_obj:
+                print(f"No usable stream qualities found for {streamer_name}: {list(streams.keys())}")
+                return
+            stream_url = stream_obj.url
             
             # Start ffmpeg
             # -i <url>: Input
             # -vf "fps=1,format=gray": 1 frame per second, grayscale
             # -y: Overwrite output
             # -update 1: Continously update the image file
+            #
+            # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
+            vf_parts = ["fps=1", "format=gray"]
+            if FRAME_WIDTH > 0:
+                # High-quality downscale to Kobo-ish width; -2 preserves aspect ratio and makes even dimensions.
+                vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
+            vf = ",".join(vf_parts)
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-re", # Read input at native frame rate (important for live streams)
                 "-i", stream_url,
-                "-vf", "fps=1,format=gray,scale=600:-1", # Resize width to 600px, keep aspect ratio
+                "-vf", vf,
+                "-q:v", str(FRAME_JPEG_QSCALE),
                 "-update", "1",
                 FRAME_PATH
             ]
@@ -262,7 +277,12 @@ def frame():
 
     # If the file exists, serve it.
     if os.path.exists(FRAME_PATH):
-        return send_file(FRAME_PATH, mimetype='image/jpeg')
+        resp = send_file(FRAME_PATH, mimetype='image/jpeg')
+        # Kobo / embedded browsers can be aggressive about caching; force a fresh fetch.
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     else:
         # Return a placeholder or 404
         # Create a simple placeholder if it doesn't exist
