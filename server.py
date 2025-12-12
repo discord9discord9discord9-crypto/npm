@@ -17,8 +17,12 @@ TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID")
 TWITCH_SECRET = os.environ.get("TWITCH_SECRET")
 TWITCH_CATEGORY = os.environ.get("TWITCH_CATEGORY", "Just Chatting")
 TWITCH_STREAM_QUALITY = os.environ.get("TWITCH_STREAM_QUALITY", "best")
-# Kobo Elipsa is 1404x1872; default to native portrait width for crisp text.
+# Kobo Elipsa panel is 1404x1872 (portrait). Kobo browser may not rotate to landscape,
+# so we optionally rotate frames server-side to make "device-rotated" viewing work.
 FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
+FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
+# "cw" (clockwise), "ccw" (counter-clockwise), or "none"
+FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
 # JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
 FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 PORT = int(os.environ.get("PORT", 5000))
@@ -141,10 +145,28 @@ def start_stream_processing(streamer_name):
             # -update 1: Continously update the image file
             #
             # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
-            vf_parts = ["fps=1", "format=gray"]
-            if FRAME_WIDTH > 0:
-                # High-quality downscale to Kobo-ish width; -2 preserves aspect ratio and makes even dimensions.
+            vf_parts = ["fps=1"]
+            if FRAME_ROTATE in ("cw", "clockwise", "90"):
+                vf_parts.append("transpose=1")
+            elif FRAME_ROTATE in ("ccw", "counterclockwise", "counter-clockwise", "-90", "270"):
+                vf_parts.append("transpose=2")
+
+            if FRAME_WIDTH > 0 and FRAME_HEIGHT > 0:
+                # Fit within the Kobo's portrait canvas (or your configured canvas).
+                # If rotated, this makes sideways-holding the device effectively "landscape".
+                vf_parts.append(
+                    f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
+                )
+                vf_parts.append(
+                    f"pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=white"
+                )
+            elif FRAME_WIDTH > 0:
+                # Fallback: scale to width, preserve aspect.
                 vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
+
+            # Kobo is grayscale; force grayscale output.
+            vf_parts.append("format=gray")
+            vf_parts.append("setsar=1")
             vf = ",".join(vf_parts)
             cmd = [
                 "ffmpeg",
