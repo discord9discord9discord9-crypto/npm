@@ -6,6 +6,9 @@ import requests
 import signal
 from flask import Flask, Response, request, render_template_string, redirect, url_for, send_file
 from streamlink import Streamlink
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
