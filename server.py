@@ -17,8 +17,16 @@ TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID")
 TWITCH_SECRET = os.environ.get("TWITCH_SECRET")
 TWITCH_CATEGORY = os.environ.get("TWITCH_CATEGORY", "Just Chatting")
 TWITCH_STREAM_QUALITY = os.environ.get("TWITCH_STREAM_QUALITY", "best")
+<<<<<<< cursor/image-clarity-and-resolution-e7b0
+# Kobo Elipsa is 1404x1872 (portrait). If you hold it landscape but the browser won't rotate,
+# we rotate the page via CSS and target true landscape pixels (1872x1404) for crisp text.
+FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1872"))
+FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1404"))
+FRAME_SCALE_MODE = os.environ.get("FRAME_SCALE_MODE", "cover")  # "cover" or "contain"
+=======
 # Kobo Elipsa is 1404x1872; default to native portrait width for crisp text.
 FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
+>>>>>>> main
 # JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
 FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 PORT = int(os.environ.get("PORT", 5000))
@@ -141,9 +149,31 @@ def start_stream_processing(streamer_name):
             # -update 1: Continously update the image file
             #
             # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
+<<<<<<< cursor/image-clarity-and-resolution-e7b0
+            # For Kobo landscape-view-with-rotation, we target a true landscape raster (FRAME_WIDTH x FRAME_HEIGHT).
+            vf_parts = ["fps=1", "format=gray"]
+            if FRAME_WIDTH > 0 and FRAME_HEIGHT > 0:
+                if FRAME_SCALE_MODE == "contain":
+                    # Letterbox (no cropping).
+                    vf_parts.append(
+                        f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
+                    )
+                    vf_parts.append(
+                        f"pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+                    )
+                else:
+                    # Cover (fills the whole screen; may crop).
+                    vf_parts.append(
+                        f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase:flags=lanczos"
+                    )
+                    vf_parts.append(f"crop={FRAME_WIDTH}:{FRAME_HEIGHT}")
+            elif FRAME_WIDTH > 0:
+                # Fallback: width-only scaling.
+=======
             vf_parts = ["fps=1", "format=gray"]
             if FRAME_WIDTH > 0:
                 # High-quality downscale to Kobo-ish width; -2 preserves aspect ratio and makes even dimensions.
+>>>>>>> main
                 vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
             vf = ",".join(vf_parts)
             cmd = [
@@ -220,11 +250,27 @@ VIEW_HTML = """
     <title>{{ streamer }}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { margin: 0; padding: 0; background: #fff; text-align: center; height: 100vh; display: flex; flex-direction: column; }
-        #stream-container { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-        img { max-width: 100%; max-height: 100%; object-fit: contain; filter: grayscale(100%); }
-        .controls { padding: 10px; border-top: 1px solid #000; }
-        a { text-decoration: none; color: #000; border: 1px solid #000; padding: 5px 15px; }
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #fff; overflow: hidden; }
+
+        /* Rotate the entire UI 90deg so holding the Kobo landscape looks correct. */
+        #rotator {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vh;
+            height: 100vw;
+            transform: rotate(90deg) translateY(-100%);
+            transform-origin: top left;
+            background: #fff;
+        }
+
+        #stream-container { position: relative; width: 100%; height: 100%; overflow: hidden; }
+        img { width: 100%; height: 100%; object-fit: cover; }
+
+        /* Keep controls as a small overlay (doesn't shrink the image). */
+        .controls { position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 10px; background: rgba(255,255,255,0.92); border-top: 1px solid #000; font-family: sans-serif; }
+        a { text-decoration: none; color: #000; border: 1px solid #000; padding: 4px 10px; background: #fff; }
+        .controls span { margin-left: 10px; }
     </style>
     <script>
         function refreshImage() {
@@ -241,12 +287,14 @@ VIEW_HTML = """
     </script>
 </head>
 <body>
-    <div id="stream-container">
-        <img id="stream-frame" src="/frame.jpg" onerror="handleError()" alt="Stream Loading...">
-    </div>
-    <div class="controls">
-        <a href="/">Back to List</a>
-        <span>{{ streamer }}</span>
+    <div id="rotator">
+        <div id="stream-container">
+            <img id="stream-frame" src="/frame.jpg" onerror="handleError()" alt="Stream Loading...">
+            <div class="controls">
+                <a href="/">Back</a>
+                <span>{{ streamer }}</span>
+            </div>
+        </div>
     </div>
 </body>
 </html>
