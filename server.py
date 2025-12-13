@@ -23,10 +23,10 @@ FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
 FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
 # "cw" (clockwise), "ccw" (counter-clockwise), or "none"
 FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
-# Target frames per second for the generated JPEGs. Higher FPS = smoother, more CPU.
-FRAME_FPS = float(os.environ.get("FRAME_FPS", "3"))
-# Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs).
-FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", str(int(1000 / max(0.1, FRAME_FPS)))))
+# Target frames per second for the generated JPEGs. Lower default for e-ink comfort/CPU.
+FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.5"))
+# Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs). Slower by default for e-ink.
+FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", "1500"))
 # JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
 FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 PORT = int(os.environ.get("PORT", 5000))
