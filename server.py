@@ -4,7 +4,7 @@ import subprocess
 import threading
 import requests
 import signal
-from flask import Flask, Response, request, render_template_string, redirect, url_for, send_file
+from flask import Flask, Response, request, render_template_string, redirect, url_for, send_file, make_response
 from streamlink import Streamlink
 from dotenv import load_dotenv
 
@@ -30,6 +30,7 @@ PORT = int(os.environ.get("PORT", 5000))
 # Global State
 current_process = None
 current_streamer = None
+current_quality = None
 last_restart_time = 0
 stream_lock = threading.Lock()
 FRAME_PATH = "current.jpg"
@@ -103,26 +104,83 @@ class TwitchAPI:
 
 twitch_api = TwitchAPI(TWITCH_CLIENT_ID, TWITCH_SECRET)
 
-def start_stream_processing(streamer_name):
-    global current_process, current_streamer, last_restart_time
+def create_streamlink_session():
+    """
+    Configure Streamlink to minimize buffering/memory use inside the 512MB container.
+    """
+    session = Streamlink()
+    session.set_option("hls-live-edge", 1)              # keep only the newest segments
+    session.set_option("hls-segment-threads", 1)        # avoid parallel segment downloads
+    session.set_option("stream-segment-threads", 1)
+    session.set_option("hls-segment-queue-size", 2)     # keep a tiny in-memory queue
+    session.set_option("hls-playlist-reload-attempts", 2)
+    session.set_option("hls-segment-attempts", 2)
+    return session
+
+def get_stream_qualities(streamer_name):
+    """
+    Return available qualities for the streamer with minimal buffering.
+    """
+    session = create_streamlink_session()
+    try:
+        streams = session.streams(f"twitch.tv/{streamer_name}")
+        return list(streams.keys()) if streams else []
+    except Exception as e:
+        print(f"Error listing qualities for {streamer_name}: {e}")
+        return []
+    finally:
+        # Close HTTP session to release sockets/memory promptly
+        try:
+            session.http.close()
+        except Exception:
+            pass
+
+def pick_stream(streams, desired_quality):
+    """
+    Pick the best available stream object preferring the user choice, then sane fallbacks.
+    """
+    order = [desired_quality, "best", "720p", "480p", "worst"]
+    for q in order:
+        if q and q in streams:
+            return q, streams[q]
+    # Final fallback: first available
+    if streams:
+        q = next(iter(streams.keys()))
+        return q, streams[q]
+    return None, None
+
+def start_stream_processing(streamer_name, preferred_quality=None):
+    global current_process, current_streamer, current_quality, last_restart_time
     
     with stream_lock:
-        if current_streamer == streamer_name and current_process and current_process.poll() is None:
-            return # Already watching this streamer
+        desired_quality = preferred_quality or TWITCH_STREAM_QUALITY
+
+        if (
+            current_streamer == streamer_name
+            and current_quality == desired_quality
+            and current_process
+            and current_process.poll() is None
+        ):
+            return # Already watching this streamer at requested quality
         
-        # Rate limit restarts (e.g., 10 seconds)
-        if time.time() - last_restart_time < 10:
-             return
+        # Rate limit restarts for the same streamer/quality (e.g., 10 seconds)
+        if (
+            time.time() - last_restart_time < 10
+            and current_streamer == streamer_name
+            and current_quality == desired_quality
+        ):
+            return
 
         # Stop existing process
         if current_process:
             stop_stream_processing()
             
         current_streamer = streamer_name
+        current_quality = desired_quality
         last_restart_time = time.time()
         
         # Get Stream URL using Streamlink
-        session = Streamlink()
+        session = create_streamlink_session()
         try:
             streams = session.streams(f"twitch.tv/{streamer_name}")
             if not streams:
@@ -130,13 +188,12 @@ def start_stream_processing(streamer_name):
                 # Don't unset current_streamer, so we can retry later via frame()
                 return
             
-            # Prefer higher quality for readability on e-ink (text clarity).
-            # Allow overriding via TWITCH_STREAM_QUALITY (e.g., "best", "1080p", "720p", "worst").
-            stream_obj = streams.get(TWITCH_STREAM_QUALITY) or streams.get("best") or streams.get("720p") or streams.get("480p") or streams.get("worst")
+            quality_used, stream_obj = pick_stream(streams, desired_quality)
             if not stream_obj:
                 print(f"No usable stream qualities found for {streamer_name}: {list(streams.keys())}")
                 return
             stream_url = stream_obj.url
+            current_quality = quality_used
             
             # Start ffmpeg
             # -i <url>: Input
@@ -170,11 +227,21 @@ def start_stream_processing(streamer_name):
             vf = ",".join(vf_parts)
             cmd = [
                 "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
                 "-y",
+                "-analyzeduration", "0",
+                "-probesize", "32k",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-rtbufsize", "16M",
                 "-re", # Read input at native frame rate (important for live streams)
                 "-i", stream_url,
                 "-vf", vf,
                 "-q:v", str(FRAME_JPEG_QSCALE),
+                "-map_metadata", "-1",
+                "-vsync", "0",
+                "-flush_packets", "1",
                 "-update", "1",
                 FRAME_PATH
             ]
@@ -186,9 +253,14 @@ def start_stream_processing(streamer_name):
         except Exception as e:
             print(f"Error starting stream: {e}")
             # Keep current_streamer set to allow retries
+        finally:
+            try:
+                session.http.close()
+            except Exception:
+                pass
 
 def stop_stream_processing():
-    global current_process, current_streamer
+    global current_process, current_streamer, current_quality
     if current_process:
         current_process.terminate()
         try:
@@ -197,6 +269,7 @@ def stop_stream_processing():
             current_process.kill()
         current_process = None
     current_streamer = None
+    current_quality = None
 
 # Templates
 INDEX_HTML = """
@@ -205,6 +278,9 @@ INDEX_HTML = """
 <head>
     <title>Kobo Twitch</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <style>
         body { font-family: sans-serif; background: #fff; color: #000; padding: 10px; }
         h1 { font-size: 1.5em; text-align: center; }
@@ -241,19 +317,26 @@ VIEW_HTML = """
 <head>
     <title>{{ streamer }}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <style>
         body { margin: 0; padding: 0; background: #fff; text-align: center; height: 100vh; display: flex; flex-direction: column; }
         #stream-container { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
         img { max-width: 100%; max-height: 100%; object-fit: contain; filter: grayscale(100%); }
         .controls { padding: 10px; border-top: 1px solid #000; }
         a { text-decoration: none; color: #000; border: 1px solid #000; padding: 5px 15px; }
+        select { padding: 5px; margin-right: 10px; }
+        .hint { font-size: 0.9em; color: #444; padding: 8px; }
     </style>
     <script>
         function refreshImage() {
             var img = document.getElementById('stream-frame');
             img.src = '/frame.jpg?t=' + new Date().getTime();
         }
+        {% if autoplay %}
         setInterval(refreshImage, 1000);
+        {% endif %}
         
         // Auto-reload page on error (offline detection fallback)
         function handleError() {
@@ -264,9 +347,22 @@ VIEW_HTML = """
 </head>
 <body>
     <div id="stream-container">
+        {% if autoplay %}
         <img id="stream-frame" src="/frame.jpg" onerror="handleError()" alt="Stream Loading...">
+        {% else %}
+        <div class="hint">Select a quality below to start streaming.</div>
+        {% endif %}
     </div>
     <div class="controls">
+        <form id="quality-form" method="get" style="display:inline-block;">
+            <label for="quality">Quality:</label>
+            <select name="quality" id="quality" onchange="this.form.submit()">
+                {% for q in qualities %}
+                <option value="{{ q }}" {% if q == selected_quality %}selected{% endif %}>{{ q }}</option>
+                {% endfor %}
+            </select>
+            <noscript><button type="submit">Set</button></noscript>
+        </form>
         <a href="/">Back to List</a>
         <span>{{ streamer }}</span>
     </div>
@@ -282,9 +378,33 @@ def index():
 
 @app.route('/view/<streamer>')
 def view(streamer):
-    # Start processing in background if not already
-    start_stream_processing(streamer)
-    return render_template_string(VIEW_HTML, streamer=streamer)
+    requested_quality = request.args.get("quality")
+    qualities = get_stream_qualities(streamer)
+
+    # Always include the configured default and common fallbacks, and dedupe.
+    baseline_qualities = [TWITCH_STREAM_QUALITY, "best", "1080p", "720p", "480p", "360p", "worst"]
+    qualities = list(dict.fromkeys((qualities or []) + baseline_qualities))
+
+    selected_quality = requested_quality or (qualities[0] if qualities else TWITCH_STREAM_QUALITY)
+
+    # Start processing only after the user has picked a quality
+    autoplay = requested_quality is not None
+    if autoplay:
+        start_stream_processing(streamer, selected_quality)
+
+    resp = make_response(
+        render_template_string(
+            VIEW_HTML,
+            streamer=streamer,
+            qualities=qualities,
+            selected_quality=selected_quality,
+            autoplay=autoplay,
+        )
+    )
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 @app.route('/frame.jpg')
 def frame():
