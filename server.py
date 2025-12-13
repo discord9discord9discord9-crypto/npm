@@ -489,7 +489,7 @@ def view(streamer):
     # Clamp refresh interval for Kobo e-ink; tie it loosely to selected fps.
     refresh_ms = request.args.get("refresh_ms", type=int)
     if refresh_ms is None:
-        refresh_ms = int(max(300, min(4000, 1000.0 / max(0.1, selected_fps)))))
+        refresh_ms = int(max(300, min(4000, 1000.0 / max(0.1, selected_fps))))
 
     # Start processing only after the user has picked a quality
     autoplay = requested_quality is not None
