@@ -23,6 +23,10 @@ FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
 FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
 # "cw" (clockwise), "ccw" (counter-clockwise), or "none"
 FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
+# Target frames per second for the generated JPEGs. Higher FPS = smoother, more CPU.
+FRAME_FPS = float(os.environ.get("FRAME_FPS", "3"))
+# Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs).
+FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", str(int(1000 / max(0.1, FRAME_FPS)))))
 # JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
 FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 PORT = int(os.environ.get("PORT", 5000))
@@ -31,6 +35,7 @@ PORT = int(os.environ.get("PORT", 5000))
 current_process = None
 current_streamer = None
 current_quality = None
+current_qscale = None
 last_restart_time = 0
 stream_lock = threading.Lock()
 FRAME_PATH = "current.jpg"
@@ -139,7 +144,18 @@ def pick_stream(streams, desired_quality):
     """
     Pick the best available stream object preferring the user choice, then sane fallbacks.
     """
-    order = [desired_quality, "best", "720p", "480p", "worst"]
+    order = [
+        desired_quality,
+        "source",
+        "1080p60",
+        "1080p",
+        "best",
+        "720p60",
+        "720p",
+        "480p",
+        "360p",
+        "worst",
+    ]
     for q in order:
         if q and q in streams:
             return q, streams[q]
@@ -149,15 +165,17 @@ def pick_stream(streams, desired_quality):
         return q, streams[q]
     return None, None
 
-def start_stream_processing(streamer_name, preferred_quality=None):
-    global current_process, current_streamer, current_quality, last_restart_time
+def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None):
+    global current_process, current_streamer, current_quality, current_qscale, last_restart_time
     
     with stream_lock:
         desired_quality = preferred_quality or TWITCH_STREAM_QUALITY
+        desired_qscale = image_qscale or FRAME_JPEG_QSCALE
 
         if (
             current_streamer == streamer_name
             and current_quality == desired_quality
+            and current_qscale == desired_qscale
             and current_process
             and current_process.poll() is None
         ):
@@ -168,6 +186,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
             time.time() - last_restart_time < 10
             and current_streamer == streamer_name
             and current_quality == desired_quality
+            and current_qscale == desired_qscale
         ):
             return
 
@@ -177,6 +196,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
             
         current_streamer = streamer_name
         current_quality = desired_quality
+        current_qscale = desired_qscale
         last_restart_time = time.time()
         
         # Get Stream URL using Streamlink
@@ -194,6 +214,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
                 return
             stream_url = stream_obj.url
             current_quality = quality_used
+            current_qscale = desired_qscale
             
             # Start ffmpeg
             # -i <url>: Input
@@ -202,7 +223,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
             # -update 1: Continously update the image file
             #
             # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
-            vf_parts = ["fps=1"]
+            vf_parts = [f"fps={FRAME_FPS}"]
             if FRAME_ROTATE in ("cw", "clockwise", "90"):
                 vf_parts.append("transpose=1")
             elif FRAME_ROTATE in ("ccw", "counterclockwise", "counter-clockwise", "-90", "270"):
@@ -238,7 +259,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
                 "-re", # Read input at native frame rate (important for live streams)
                 "-i", stream_url,
                 "-vf", vf,
-                "-q:v", str(FRAME_JPEG_QSCALE),
+                "-q:v", str(desired_qscale),
                 "-map_metadata", "-1",
                 "-vsync", "0",
                 "-flush_packets", "1",
@@ -260,7 +281,7 @@ def start_stream_processing(streamer_name, preferred_quality=None):
                 pass
 
 def stop_stream_processing():
-    global current_process, current_streamer, current_quality
+    global current_process, current_streamer, current_quality, current_qscale
     if current_process:
         current_process.terminate()
         try:
@@ -270,6 +291,33 @@ def stop_stream_processing():
         current_process = None
     current_streamer = None
     current_quality = None
+    current_qscale = None
+
+def mjpeg_generator():
+    """
+    Stream the latest JPEG as a multipart/x-mixed-replace stream.
+    This makes the Kobo browser render near-realtime frames without 1s polling.
+    """
+    boundary = b"--frame"
+    min_interval = max(0.05, 1.0 / max(1.0, FRAME_FPS * 1.5))  # slightly faster than ffmpeg fps
+    while True:
+        try:
+            if os.path.exists(FRAME_PATH):
+                with open(FRAME_PATH, "rb") as f:
+                    data = f.read()
+                if data:
+                    yield boundary + b"\r\n"
+                    yield b"Content-Type: image/jpeg\r\n"
+                    yield b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                    yield b"Pragma: no-cache\r\n"
+                    yield f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
+                    yield data + b"\r\n"
+            time.sleep(min_interval)
+        except GeneratorExit:
+            break
+        except Exception as e:
+            print(f"mjpeg stream error: {e}")
+            time.sleep(0.5)
 
 # Templates
 INDEX_HTML = """
@@ -330,38 +378,41 @@ VIEW_HTML = """
         .hint { font-size: 0.9em; color: #444; padding: 8px; }
     </style>
     <script>
-        function refreshImage() {
-            var img = document.getElementById('stream-frame');
-            img.src = '/frame.jpg?t=' + new Date().getTime();
-        }
+        // Minimal JS loop: just replace the image src with a cache-busted URL.
         {% if autoplay %}
-        setInterval(refreshImage, 1000);
+        (function loop() {
+            var img = document.getElementById('stream-frame');
+            if (img) {
+                img.src = '/frame.jpg?t=' + Date.now();
+            }
+            setTimeout(loop, {{ refresh_ms }});
+        })();
         {% endif %}
-        
-        // Auto-reload page on error (offline detection fallback)
-        function handleError() {
-            console.log("Image load error, retrying...");
-            setTimeout(refreshImage, 2000);
-        }
     </script>
 </head>
 <body>
     <div id="stream-container">
         {% if autoplay %}
-        <img id="stream-frame" src="/frame.jpg" onerror="handleError()" alt="Stream Loading...">
+        <img id="stream-frame" src="/frame.jpg" alt="Stream Loading...">
         {% else %}
         <div class="hint">Select a quality below to start streaming.</div>
         {% endif %}
     </div>
     <div class="controls">
         <form id="quality-form" method="get" style="display:inline-block;">
-            <label for="quality">Quality:</label>
+            <label for="quality">Stream:</label>
             <select name="quality" id="quality" onchange="this.form.submit()">
                 {% for q in qualities %}
                 <option value="{{ q }}" {% if q == selected_quality %}selected{% endif %}>{{ q }}</option>
                 {% endfor %}
             </select>
-            <noscript><button type="submit">Set</button></noscript>
+            <label for="imgq">Image:</label>
+            <select name="imgq" id="imgq" onchange="this.form.submit()">
+                {% for qv, qlabel in image_quality_options %}
+                <option value="{{ qv }}" {% if qv == selected_imgq %}selected{% endif %}>{{ qlabel }}</option>
+                {% endfor %}
+            </select>
+            <noscript><button type="submit">Apply</button></noscript>
         </form>
         <a href="/">Back to List</a>
         <span>{{ streamer }}</span>
@@ -379,18 +430,37 @@ def index():
 @app.route('/view/<streamer>')
 def view(streamer):
     requested_quality = request.args.get("quality")
+    requested_imgq = request.args.get("imgq", type=int)
     qualities = get_stream_qualities(streamer)
 
     # Always include the configured default and common fallbacks, and dedupe.
-    baseline_qualities = [TWITCH_STREAM_QUALITY, "best", "1080p", "720p", "480p", "360p", "worst"]
+    baseline_qualities = [
+        TWITCH_STREAM_QUALITY,
+        "source",
+        "1080p60",
+        "1080p",
+        "720p60",
+        "720p",
+        "480p",
+        "360p",
+        "worst",
+    ]
     qualities = list(dict.fromkeys((qualities or []) + baseline_qualities))
 
     selected_quality = requested_quality or (qualities[0] if qualities else TWITCH_STREAM_QUALITY)
+    selected_imgq = requested_imgq or FRAME_JPEG_QSCALE
+
+    image_quality_options = [
+        (1, "HQ (q=1)"),
+        (2, "High (q=2)"),
+        (4, "Medium (q=4)"),
+        (8, "Light (q=8)"),
+    ]
 
     # Start processing only after the user has picked a quality
     autoplay = requested_quality is not None
     if autoplay:
-        start_stream_processing(streamer, selected_quality)
+        start_stream_processing(streamer, selected_quality, selected_imgq)
 
     resp = make_response(
         render_template_string(
@@ -398,6 +468,9 @@ def view(streamer):
             streamer=streamer,
             qualities=qualities,
             selected_quality=selected_quality,
+            image_quality_options=image_quality_options,
+            selected_imgq=selected_imgq,
+            refresh_ms=FRAME_REFRESH_MS,
             autoplay=autoplay,
         )
     )
@@ -435,6 +508,20 @@ def frame():
 @app.route('/health')
 def health():
     return "OK", 200
+
+@app.route('/stream.mjpg')
+def stream_mjpg():
+    # Ensure a stream is running; if not, trigger restart in background
+    global current_process, current_streamer
+    if current_streamer and (not current_process or current_process.poll() is not None):
+        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale)).start()
+
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    return Response(mjpeg_generator(), mimetype="multipart/x-mixed-replace; boundary=frame", headers=headers)
 
 # Cleanup on exit
 def cleanup(signum, frame):
