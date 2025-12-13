@@ -406,25 +406,31 @@ VIEW_HTML = """
         {% endif %}
     </div>
     <div class="controls">
-        <form id="quality-form" method="get" style="display:inline-block;">
-            <label for="quality">Stream:</label>
-            <select name="quality" id="quality" onchange="this.form.submit()">
-                {% for q in qualities %}
-                <option value="{{ q }}" {% if q == selected_quality %}selected{% endif %}>{{ q }}</option>
-                {% endfor %}
-            </select>
-            <label for="imgq">Image:</label>
-            <select name="imgq" id="imgq" onchange="this.form.submit()">
-                {% for qv, qlabel in image_quality_options %}
-                <option value="{{ qv }}" {% if qv == selected_imgq %}selected{% endif %}>{{ qlabel }}</option>
-                {% endfor %}
-            </select>
-            <label for="fps">FPS:</label>
-            <select name="fps" id="fps" onchange="this.form.submit()">
-                {% for fv, flabel in fps_options %}
-                <option value="{{ fv }}" {% if fv == selected_fps %}selected{% endif %}>{{ flabel }}</option>
-                {% endfor %}
-            </select>
+        <form id="quality-form" method="get" style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
+            <div>
+                <label for="quality">Stream:</label>
+                <select name="quality" id="quality" onchange="this.form.submit()">
+                    {% for q in qualities %}
+                    <option value="{{ q }}" {% if q == selected_quality %}selected{% endif %}>{{ q }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="imgq">Image:</label>
+                <select name="imgq" id="imgq" onchange="this.form.submit()">
+                    {% for qv, qlabel in image_quality_options %}
+                    <option value="{{ qv }}" {% if qv == selected_imgq %}selected{% endif %}>{{ qlabel }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="fps">FPS:</label>
+                <select name="fps" id="fps" onchange="this.form.submit()">
+                    {% for fv, flabel in fps_options %}
+                    <option value="{{ fv }}" {% if fv == selected_fps %}selected{% endif %}>{{ flabel }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <noscript><button type="submit">Apply</button></noscript>
         </form>
         <a href="/">Back to List</a>
