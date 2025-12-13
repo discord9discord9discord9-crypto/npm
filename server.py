@@ -36,6 +36,7 @@ current_process = None
 current_streamer = None
 current_quality = None
 current_qscale = None
+current_fps = None
 last_restart_time = 0
 stream_lock = threading.Lock()
 FRAME_PATH = "current.jpg"
@@ -165,17 +166,19 @@ def pick_stream(streams, desired_quality):
         return q, streams[q]
     return None, None
 
-def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None):
-    global current_process, current_streamer, current_quality, current_qscale, last_restart_time
+def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None, frame_fps=None):
+    global current_process, current_streamer, current_quality, current_qscale, current_fps, last_restart_time
     
     with stream_lock:
         desired_quality = preferred_quality or TWITCH_STREAM_QUALITY
         desired_qscale = image_qscale or FRAME_JPEG_QSCALE
+        desired_fps = frame_fps or FRAME_FPS
 
         if (
             current_streamer == streamer_name
             and current_quality == desired_quality
             and current_qscale == desired_qscale
+            and current_fps == desired_fps
             and current_process
             and current_process.poll() is None
         ):
@@ -187,6 +190,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             and current_streamer == streamer_name
             and current_quality == desired_quality
             and current_qscale == desired_qscale
+            and current_fps == desired_fps
         ):
             return
 
@@ -197,6 +201,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
         current_streamer = streamer_name
         current_quality = desired_quality
         current_qscale = desired_qscale
+        current_fps = desired_fps
         last_restart_time = time.time()
         
         # Get Stream URL using Streamlink
@@ -215,6 +220,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             stream_url = stream_obj.url
             current_quality = quality_used
             current_qscale = desired_qscale
+            current_fps = desired_fps
             
             # Start ffmpeg
             # -i <url>: Input
@@ -223,7 +229,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             # -update 1: Continously update the image file
             #
             # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
-            vf_parts = [f"fps={FRAME_FPS}"]
+            vf_parts = [f"fps={desired_fps}"]
             if FRAME_ROTATE in ("cw", "clockwise", "90"):
                 vf_parts.append("transpose=1")
             elif FRAME_ROTATE in ("ccw", "counterclockwise", "counter-clockwise", "-90", "270"):
@@ -281,7 +287,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 pass
 
 def stop_stream_processing():
-    global current_process, current_streamer, current_quality, current_qscale
+    global current_process, current_streamer, current_quality, current_qscale, current_fps
     if current_process:
         current_process.terminate()
         try:
@@ -292,6 +298,7 @@ def stop_stream_processing():
     current_streamer = None
     current_quality = None
     current_qscale = None
+    current_fps = None
 
 def mjpeg_generator():
     """
@@ -412,6 +419,12 @@ VIEW_HTML = """
                 <option value="{{ qv }}" {% if qv == selected_imgq %}selected{% endif %}>{{ qlabel }}</option>
                 {% endfor %}
             </select>
+            <label for="fps">FPS:</label>
+            <select name="fps" id="fps" onchange="this.form.submit()">
+                {% for fv, flabel in fps_options %}
+                <option value="{{ fv }}" {% if fv == selected_fps %}selected{% endif %}>{{ flabel }}</option>
+                {% endfor %}
+            </select>
             <noscript><button type="submit">Apply</button></noscript>
         </form>
         <a href="/">Back to List</a>
@@ -431,6 +444,7 @@ def index():
 def view(streamer):
     requested_quality = request.args.get("quality")
     requested_imgq = request.args.get("imgq", type=int)
+    requested_fps = request.args.get("fps", type=float)
     qualities = get_stream_qualities(streamer)
 
     # Always include the configured default and common fallbacks, and dedupe.
@@ -449,6 +463,7 @@ def view(streamer):
 
     selected_quality = requested_quality or (qualities[0] if qualities else TWITCH_STREAM_QUALITY)
     selected_imgq = requested_imgq or FRAME_JPEG_QSCALE
+    selected_fps = requested_fps or FRAME_FPS
 
     image_quality_options = [
         (1, "HQ (q=1)"),
@@ -456,11 +471,24 @@ def view(streamer):
         (4, "Medium (q=4)"),
         (8, "Light (q=8)"),
     ]
+    fps_options = [
+        (0.5, "0.5 fps (very slow)"),
+        (1.0, "1 fps (slow)"),
+        (1.5, "1.5 fps (default)"),
+        (2.0, "2 fps"),
+        (3.0, "3 fps"),
+        (4.0, "4 fps (faster)"),
+    ]
+
+    # Clamp refresh interval for Kobo e-ink; tie it loosely to selected fps.
+    refresh_ms = request.args.get("refresh_ms", type=int)
+    if refresh_ms is None:
+        refresh_ms = int(max(300, min(4000, 1000.0 / max(0.1, selected_fps)))))
 
     # Start processing only after the user has picked a quality
     autoplay = requested_quality is not None
     if autoplay:
-        start_stream_processing(streamer, selected_quality, selected_imgq)
+        start_stream_processing(streamer, selected_quality, selected_imgq, selected_fps)
 
     resp = make_response(
         render_template_string(
@@ -470,7 +498,9 @@ def view(streamer):
             selected_quality=selected_quality,
             image_quality_options=image_quality_options,
             selected_imgq=selected_imgq,
-            refresh_ms=FRAME_REFRESH_MS,
+            fps_options=fps_options,
+            selected_fps=selected_fps,
+            refresh_ms=refresh_ms,
             autoplay=autoplay,
         )
     )
@@ -514,7 +544,7 @@ def stream_mjpg():
     # Ensure a stream is running; if not, trigger restart in background
     global current_process, current_streamer
     if current_streamer and (not current_process or current_process.poll() is not None):
-        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale)).start()
+        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale, current_fps)).start()
 
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
