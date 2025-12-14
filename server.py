@@ -24,11 +24,17 @@ FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
 # "cw" (clockwise), "ccw" (counter-clockwise), or "none"
 FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
 # Target frames per second for the generated JPEGs. Lower default for e-ink comfort/CPU.
-FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.5"))
+FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.0"))
 # Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs). Slower by default for e-ink.
 FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", "1500"))
-# JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
-FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
+# JPEG quality for ffmpeg's mjpeg encoder: lower is better (4 is lightweight default)
+FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "4"))
+# Scaling filter; fast_bilinear is lighter than the previous lanczos default.
+FRAME_SCALE_FLAGS = os.environ.get("FRAME_SCALE_FLAGS", "fast_bilinear")
+# Constrain ffmpeg threads so Render's 0.1 CPU quota does not get throttled.
+FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", "1"))
+# Restart ffmpeg if frames stop updating for this many seconds.
+FRAME_STALE_SEC = float(os.environ.get("FRAME_STALE_SEC", "20"))
 PORT = int(os.environ.get("PORT", 5000))
 
 # Global State
@@ -39,6 +45,8 @@ current_qscale = None
 current_fps = None
 last_restart_time = 0
 stream_lock = threading.Lock()
+restart_lock = threading.Lock()
+restart_inflight = False
 FRAME_PATH = "current.jpg"
 PLACEHOLDER_PATH = "placeholder.jpg"
 
@@ -166,6 +174,38 @@ def pick_stream(streams, desired_quality):
         return q, streams[q]
     return None, None
 
+def process_alive():
+    return current_process is not None and current_process.poll() is None
+
+def frame_is_stale(max_age=FRAME_STALE_SEC):
+    if not os.path.exists(FRAME_PATH):
+        return True
+    try:
+        return (time.time() - os.path.getmtime(FRAME_PATH)) > max_age
+    except OSError:
+        return True
+
+def trigger_background_restart(streamer=None, preferred_quality=None, image_qscale=None, frame_fps=None):
+    """
+    Prevent restart thrash by allowing only one restart thread at a time.
+    """
+    global restart_inflight
+    if not streamer:
+        return
+    with restart_lock:
+        if restart_inflight:
+            return
+        restart_inflight = True
+
+    def _worker():
+        try:
+            start_stream_processing(streamer, preferred_quality, image_qscale, frame_fps)
+        finally:
+            with restart_lock:
+                restart_inflight = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None, frame_fps=None):
     global current_process, current_streamer, current_quality, current_qscale, current_fps, last_restart_time
     
@@ -239,14 +279,14 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 # Fit within the Kobo's portrait canvas (or your configured canvas).
                 # If rotated, this makes sideways-holding the device effectively "landscape".
                 vf_parts.append(
-                    f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
+                    f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags={FRAME_SCALE_FLAGS}"
                 )
                 vf_parts.append(
                     f"pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=white"
                 )
             elif FRAME_WIDTH > 0:
                 # Fallback: scale to width, preserve aspect.
-                vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
+                vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags={FRAME_SCALE_FLAGS}")
 
             # Kobo is grayscale; force grayscale output.
             vf_parts.append("format=gray")
@@ -265,6 +305,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 "-re", # Read input at native frame rate (important for live streams)
                 "-i", stream_url,
                 "-vf", vf,
+                "-threads", str(FFMPEG_THREADS),
                 "-q:v", str(desired_qscale),
                 "-map_metadata", "-1",
                 "-vsync", "0",
@@ -519,12 +560,8 @@ def view(streamer):
 def frame():
     # Check if stream process is alive; if not and we have a target, try to restart
     global current_process, current_streamer
-    if current_streamer and (not current_process or current_process.poll() is not None):
-        # Trigger restart in background to avoid blocking request? 
-        # Or just do it here (it's fast enough to spawn)
-        # We need to run it in a thread to not block the request?
-        # start_stream_processing handles rate limiting.
-        threading.Thread(target=start_stream_processing, args=(current_streamer,)).start()
+    if current_streamer and (not process_alive() or frame_is_stale()):
+        trigger_background_restart(current_streamer, current_quality, current_qscale, current_fps)
 
     # If the file exists, serve it.
     if os.path.exists(FRAME_PATH):
@@ -549,8 +586,8 @@ def health():
 def stream_mjpg():
     # Ensure a stream is running; if not, trigger restart in background
     global current_process, current_streamer
-    if current_streamer and (not current_process or current_process.poll() is not None):
-        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale, current_fps)).start()
+    if current_streamer and (not process_alive() or frame_is_stale()):
+        trigger_background_restart(current_streamer, current_quality, current_qscale, current_fps)
 
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
