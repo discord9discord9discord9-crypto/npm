@@ -24,14 +24,17 @@ FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "1404"))
 FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
 # "cw" (clockwise), "ccw" (counter-clockwise), or "none"
 FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
-# Target frames per second for the generated JPEGs. Lower default for e-ink comfort/CPU.
+# Target frames per second for the generated JPEGs.
+# Keep this reasonably low for bandwidth/CPU, but not so low that motion is unusable.
 FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.0"))
 # Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs). Slower by default for e-ink.
 FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", "1500"))
-# JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
-FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "4"))
-# Default viewer preset for slow connections: "low", "balanced", or "hq"
-BANDWIDTH_PRESET = os.environ.get("BANDWIDTH_PRESET", "low").strip().lower()
+# JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality).
+# Kobo readability benefits from keeping this relatively high quality.
+FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
+# Default viewer preset: "low", "balanced", or "hq".
+# Default to balanced so Kobo readability stays high by default.
+BANDWIDTH_PRESET = os.environ.get("BANDWIDTH_PRESET", "balanced").strip().lower()
 PORT = int(os.environ.get("PORT", 5000))
 
 # Global State
@@ -137,7 +140,9 @@ def _preset_defaults(preset: str):
     if preset == "balanced":
         return {"quality": TWITCH_STREAM_QUALITY, "imgq": FRAME_JPEG_QSCALE, "fps": FRAME_FPS, "scale": 1.0, "mode": "poll"}
     # Default: low
-    return {"quality": "worst", "imgq": 8, "fps": 0.5, "scale": 0.7, "mode": "poll"}
+    # Important for Kobo: avoid downscaling by default (it makes text/UI blurry).
+    # Save bandwidth primarily via fewer frames + lower stream rendition.
+    return {"quality": "worst", "imgq": 4, "fps": 0.5, "scale": 1.0, "mode": "poll"}
 
 def cached_get_streams(category: str, ttl_seconds: float = 30.0):
     now = time.time()
@@ -413,7 +418,7 @@ INDEX_HTML = """
     <ul class="stream-list">
         {% for stream in streams %}
         <li class="stream-item">
-            <a href="/view/{{ stream.user_name }}?preset=low&quality=worst&imgq=8&fps=0.5&scale=0.7&mode=poll">
+            <a href="/view/{{ stream.user_name }}?preset={{ default_preset }}&quality={{ default_quality }}&imgq={{ default_imgq }}&fps={{ default_fps }}&scale={{ default_scale }}&mode={{ default_mode }}">
                 <div class="stream-title">{{ stream.user_name }}</div>
                 <div class="stream-meta">{{ stream.viewer_count }} viewers - {{ stream.title }}</div>
             </a>
@@ -525,7 +530,18 @@ VIEW_HTML = """
 def index():
     category = TWITCH_CATEGORY
     streams = cached_get_streams(category)
-    return render_template_string(INDEX_HTML, streams=streams, category=category)
+    defaults = _preset_defaults(BANDWIDTH_PRESET)
+    return render_template_string(
+        INDEX_HTML,
+        streams=streams,
+        category=category,
+        default_preset=BANDWIDTH_PRESET,
+        default_quality=defaults["quality"],
+        default_imgq=defaults["imgq"],
+        default_fps=defaults["fps"],
+        default_scale=defaults["scale"],
+        default_mode=defaults["mode"],
+    )
 
 @app.route('/view/<streamer>')
 def view(streamer):
