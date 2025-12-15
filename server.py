@@ -4,6 +4,7 @@ import subprocess
 import threading
 import requests
 import signal
+import math
 from flask import Flask, Response, request, render_template_string, redirect, url_for, send_file, make_response
 from streamlink import Streamlink
 from dotenv import load_dotenv
@@ -24,11 +25,13 @@ FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "1872"))
 # "cw" (clockwise), "ccw" (counter-clockwise), or "none"
 FRAME_ROTATE = os.environ.get("FRAME_ROTATE", "cw").strip().lower()
 # Target frames per second for the generated JPEGs. Lower default for e-ink comfort/CPU.
-FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.5"))
+FRAME_FPS = float(os.environ.get("FRAME_FPS", "1.0"))
 # Client refresh interval in ms (Kobo lacks native video; we "page-flip" JPEGs). Slower by default for e-ink.
 FRAME_REFRESH_MS = int(os.environ.get("FRAME_REFRESH_MS", "1500"))
 # JPEG quality for ffmpeg's mjpeg encoder: lower is better (2 ~= very high quality)
-FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
+FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "4"))
+# Default viewer preset for slow connections: "low", "balanced", or "hq"
+BANDWIDTH_PRESET = os.environ.get("BANDWIDTH_PRESET", "low").strip().lower()
 PORT = int(os.environ.get("PORT", 5000))
 
 # Global State
@@ -37,10 +40,15 @@ current_streamer = None
 current_quality = None
 current_qscale = None
 current_fps = None
+current_scale = None
 last_restart_time = 0
 stream_lock = threading.Lock()
 FRAME_PATH = "current.jpg"
 PLACEHOLDER_PATH = "placeholder.jpg"
+
+# Small in-memory caches to reduce network work on slow links
+_STREAMS_CACHE = {"ts": 0.0, "category": None, "data": []}
+_QUALITIES_CACHE = {}  # streamer -> {"ts": float, "data": [qualities]}
 
 # Twitch API Helper
 class TwitchAPI:
@@ -110,6 +118,44 @@ class TwitchAPI:
 
 twitch_api = TwitchAPI(TWITCH_CLIENT_ID, TWITCH_SECRET)
 
+def _clamp(n, lo, hi):
+    return max(lo, min(hi, n))
+
+def _even_int(n, minimum=2):
+    n = int(n)
+    n = max(minimum, n)
+    return n if (n % 2 == 0) else (n - 1)
+
+def _preset_defaults(preset: str):
+    """
+    Defaults tuned for "really bad internet".
+    Note: ffmpeg mjpeg qscale: lower is higher quality (and bigger).
+    """
+    preset = (preset or "").strip().lower()
+    if preset == "hq":
+        return {"quality": "best", "imgq": 2, "fps": 2.0, "scale": 1.0, "mode": "poll"}
+    if preset == "balanced":
+        return {"quality": TWITCH_STREAM_QUALITY, "imgq": FRAME_JPEG_QSCALE, "fps": FRAME_FPS, "scale": 1.0, "mode": "poll"}
+    # Default: low
+    return {"quality": "worst", "imgq": 8, "fps": 0.5, "scale": 0.7, "mode": "poll"}
+
+def cached_get_streams(category: str, ttl_seconds: float = 30.0):
+    now = time.time()
+    if _STREAMS_CACHE["category"] == category and (now - _STREAMS_CACHE["ts"]) < ttl_seconds:
+        return _STREAMS_CACHE["data"]
+    data = twitch_api.get_streams(category)
+    _STREAMS_CACHE.update({"ts": now, "category": category, "data": data})
+    return data
+
+def cached_get_stream_qualities(streamer_name: str, ttl_seconds: float = 300.0):
+    now = time.time()
+    entry = _QUALITIES_CACHE.get(streamer_name)
+    if entry and (now - entry["ts"]) < ttl_seconds:
+        return entry["data"]
+    data = get_stream_qualities(streamer_name)
+    _QUALITIES_CACHE[streamer_name] = {"ts": now, "data": data}
+    return data
+
 def create_streamlink_session():
     """
     Configure Streamlink to minimize buffering/memory use inside the 512MB container.
@@ -166,19 +212,22 @@ def pick_stream(streams, desired_quality):
         return q, streams[q]
     return None, None
 
-def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None, frame_fps=None):
-    global current_process, current_streamer, current_quality, current_qscale, current_fps, last_restart_time
+def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=None, frame_fps=None, frame_scale=None):
+    global current_process, current_streamer, current_quality, current_qscale, current_fps, current_scale, last_restart_time
     
     with stream_lock:
         desired_quality = preferred_quality or TWITCH_STREAM_QUALITY
         desired_qscale = image_qscale or FRAME_JPEG_QSCALE
         desired_fps = frame_fps or FRAME_FPS
+        desired_scale = frame_scale if frame_scale is not None else 1.0
+        desired_scale = float(_clamp(desired_scale, 0.25, 1.0))
 
         if (
             current_streamer == streamer_name
             and current_quality == desired_quality
             and current_qscale == desired_qscale
             and current_fps == desired_fps
+            and current_scale == desired_scale
             and current_process
             and current_process.poll() is None
         ):
@@ -191,6 +240,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             and current_quality == desired_quality
             and current_qscale == desired_qscale
             and current_fps == desired_fps
+            and current_scale == desired_scale
         ):
             return
 
@@ -202,6 +252,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
         current_quality = desired_quality
         current_qscale = desired_qscale
         current_fps = desired_fps
+        current_scale = desired_scale
         last_restart_time = time.time()
         
         # Get Stream URL using Streamlink
@@ -238,15 +289,23 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             if FRAME_WIDTH > 0 and FRAME_HEIGHT > 0:
                 # Fit within the Kobo's portrait canvas (or your configured canvas).
                 # If rotated, this makes sideways-holding the device effectively "landscape".
+                target_w = FRAME_WIDTH
+                target_h = FRAME_HEIGHT
+                if desired_scale != 1.0:
+                    target_w = _even_int(math.floor(FRAME_WIDTH * desired_scale))
+                    target_h = _even_int(math.floor(FRAME_HEIGHT * desired_scale))
                 vf_parts.append(
-                    f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos"
                 )
                 vf_parts.append(
-                    f"pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=white"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=white"
                 )
             elif FRAME_WIDTH > 0:
                 # Fallback: scale to width, preserve aspect.
-                vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
+                target_w = FRAME_WIDTH
+                if desired_scale != 1.0:
+                    target_w = _even_int(math.floor(FRAME_WIDTH * desired_scale))
+                vf_parts.append(f"scale={target_w}:-2:flags=lanczos")
 
             # Kobo is grayscale; force grayscale output.
             vf_parts.append("format=gray")
@@ -287,7 +346,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 pass
 
 def stop_stream_processing():
-    global current_process, current_streamer, current_quality, current_qscale, current_fps
+    global current_process, current_streamer, current_quality, current_qscale, current_fps, current_scale
     if current_process:
         current_process.terminate()
         try:
@@ -299,6 +358,7 @@ def stop_stream_processing():
     current_quality = None
     current_qscale = None
     current_fps = None
+    current_scale = None
 
 def mjpeg_generator():
     """
@@ -353,7 +413,7 @@ INDEX_HTML = """
     <ul class="stream-list">
         {% for stream in streams %}
         <li class="stream-item">
-            <a href="/view/{{ stream.user_name }}">
+            <a href="/view/{{ stream.user_name }}?preset=low&quality=worst&imgq=8&fps=0.5&scale=0.7&mode=poll">
                 <div class="stream-title">{{ stream.user_name }}</div>
                 <div class="stream-meta">{{ stream.viewer_count }} viewers - {{ stream.title }}</div>
             </a>
@@ -386,7 +446,7 @@ VIEW_HTML = """
     </style>
     <script>
         // Minimal JS loop: just replace the image src with a cache-busted URL.
-        {% if autoplay %}
+        {% if autoplay and mode == 'poll' %}
         (function loop() {
             var img = document.getElementById('stream-frame');
             if (img) {
@@ -400,13 +460,18 @@ VIEW_HTML = """
 <body>
     <div id="stream-container">
         {% if autoplay %}
-        <img id="stream-frame" src="/frame.jpg" alt="Stream Loading...">
+            {% if mode == 'mjpg' %}
+            <img id="stream-frame" src="/stream.mjpg" alt="Stream Loading...">
+            {% else %}
+            <img id="stream-frame" src="/frame.jpg" alt="Stream Loading...">
+            {% endif %}
         {% else %}
         <div class="hint">Select a quality below to start streaming.</div>
         {% endif %}
     </div>
     <div class="controls">
         <form id="quality-form" method="get" style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
+            <input type="hidden" name="preset" value="{{ preset }}">
             <div>
                 <label for="quality">Stream:</label>
                 <select name="quality" id="quality" onchange="this.form.submit()">
@@ -431,6 +496,22 @@ VIEW_HTML = """
                     {% endfor %}
                 </select>
             </div>
+            <div>
+                <label for="scale">Size:</label>
+                <select name="scale" id="scale" onchange="this.form.submit()">
+                    {% for sv, slabel in scale_options %}
+                    <option value="{{ sv }}" {% if sv == selected_scale %}selected{% endif %}>{{ slabel }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="mode">Mode:</label>
+                <select name="mode" id="mode" onchange="this.form.submit()">
+                    {% for mv, mlabel in mode_options %}
+                    <option value="{{ mv }}" {% if mv == mode %}selected{% endif %}>{{ mlabel }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <noscript><button type="submit">Apply</button></noscript>
         </form>
         <a href="/">Back to List</a>
@@ -443,15 +524,22 @@ VIEW_HTML = """
 @app.route('/')
 def index():
     category = TWITCH_CATEGORY
-    streams = twitch_api.get_streams(category)
+    streams = cached_get_streams(category)
     return render_template_string(INDEX_HTML, streams=streams, category=category)
 
 @app.route('/view/<streamer>')
 def view(streamer):
+    preset = request.args.get("preset", BANDWIDTH_PRESET)
+    defaults = _preset_defaults(preset)
+
     requested_quality = request.args.get("quality")
     requested_imgq = request.args.get("imgq", type=int)
     requested_fps = request.args.get("fps", type=float)
-    qualities = get_stream_qualities(streamer)
+    requested_scale = request.args.get("scale", type=float)
+    mode = (request.args.get("mode") or defaults["mode"]).strip().lower()
+    mode = "mjpg" if mode == "mjpg" else "poll"
+
+    qualities = cached_get_stream_qualities(streamer)
 
     # Always include the configured default and common fallbacks, and dedupe.
     baseline_qualities = [
@@ -467,9 +555,11 @@ def view(streamer):
     ]
     qualities = list(dict.fromkeys((qualities or []) + baseline_qualities))
 
-    selected_quality = requested_quality or (qualities[0] if qualities else TWITCH_STREAM_QUALITY)
-    selected_imgq = requested_imgq or FRAME_JPEG_QSCALE
-    selected_fps = requested_fps or FRAME_FPS
+    selected_quality = requested_quality or (qualities[0] if qualities else defaults["quality"])
+    selected_imgq = requested_imgq or int(defaults["imgq"])
+    selected_fps = requested_fps or float(defaults["fps"])
+    selected_scale = requested_scale or float(defaults["scale"])
+    selected_scale = float(_clamp(selected_scale, 0.25, 1.0))
 
     image_quality_options = [
         (1, "HQ (q=1)"),
@@ -480,10 +570,20 @@ def view(streamer):
     fps_options = [
         (0.5, "0.5 fps (very slow)"),
         (1.0, "1 fps (slow)"),
-        (1.5, "1.5 fps (default)"),
+        (1.5, "1.5 fps"),
         (2.0, "2 fps"),
         (3.0, "3 fps"),
         (4.0, "4 fps (faster)"),
+    ]
+    scale_options = [
+        (1.0, "100% (full size)"),
+        (0.85, "85% (smaller)"),
+        (0.7, "70% (low bandwidth)"),
+        (0.55, "55% (very low bandwidth)"),
+    ]
+    mode_options = [
+        ("poll", "Polling (best compatibility)"),
+        ("mjpg", "MJPEG (1 connection)"),
     ]
 
     # Clamp refresh interval for Kobo e-ink; tie it loosely to selected fps.
@@ -494,7 +594,7 @@ def view(streamer):
     # Start processing only after the user has picked a quality
     autoplay = requested_quality is not None
     if autoplay:
-        start_stream_processing(streamer, selected_quality, selected_imgq, selected_fps)
+        start_stream_processing(streamer, selected_quality, selected_imgq, selected_fps, selected_scale)
 
     resp = make_response(
         render_template_string(
@@ -506,8 +606,13 @@ def view(streamer):
             selected_imgq=selected_imgq,
             fps_options=fps_options,
             selected_fps=selected_fps,
+            scale_options=scale_options,
+            selected_scale=selected_scale,
+            mode_options=mode_options,
+            mode=mode,
             refresh_ms=refresh_ms,
             autoplay=autoplay,
+            preset=preset,
         )
     )
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -550,7 +655,7 @@ def stream_mjpg():
     # Ensure a stream is running; if not, trigger restart in background
     global current_process, current_streamer
     if current_streamer and (not current_process or current_process.poll() is not None):
-        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale, current_fps)).start()
+        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale, current_fps, current_scale)).start()
 
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
