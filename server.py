@@ -62,12 +62,13 @@ class TwitchAPI:
         }
         try:
             resp = requests.post(url, params=params).json()
-            self.token = resp["access_token"]
-            self.token_expiry = time.time() + resp["expires_in"] - 60
-            return self.token
+            if "access_token" in resp:
+                self.token = resp["access_token"]
+                self.token_expiry = time.time() + resp["expires_in"] - 60
+                return self.token
         except Exception as e:
             print(f"Error getting token: {e}")
-            return None
+        return None
 
     def get_game_id(self, game_name):
         token = self.get_token()
@@ -112,20 +113,20 @@ twitch_api = TwitchAPI(TWITCH_CLIENT_ID, TWITCH_SECRET)
 
 def create_streamlink_session():
     """
-    Configure Streamlink to minimize buffering/memory use inside the 512MB container.
+    Configure Streamlink with settings optimized for stability on slow connections.
     """
     session = Streamlink()
-    session.set_option("hls-live-edge", 1)              # keep only the newest segments
-    session.set_option("hls-segment-threads", 1)        # avoid parallel segment downloads
-    session.set_option("stream-segment-threads", 1)
-    session.set_option("hls-segment-queue-size", 2)     # keep a tiny in-memory queue
-    session.set_option("hls-playlist-reload-attempts", 2)
-    session.set_option("hls-segment-attempts", 2)
+    session.set_option("hls-live-edge", 3)              # Increase buffer slightly
+    session.set_option("hls-segment-threads", 2)        # Allow parallel segment downloads
+    session.set_option("stream-segment-threads", 2)
+    session.set_option("hls-segment-queue-size", 4)     # Increase queue size
+    session.set_option("hls-playlist-reload-attempts", 3)
+    session.set_option("hls-segment-attempts", 3)
     return session
 
 def get_stream_qualities(streamer_name):
     """
-    Return available qualities for the streamer with minimal buffering.
+    Return available qualities for the streamer.
     """
     session = create_streamlink_session()
     try:
@@ -135,7 +136,6 @@ def get_stream_qualities(streamer_name):
         print(f"Error listing qualities for {streamer_name}: {e}")
         return []
     finally:
-        # Close HTTP session to release sockets/memory promptly
         try:
             session.http.close()
         except Exception:
@@ -184,9 +184,9 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
         ):
             return # Already watching this streamer at requested quality
         
-        # Rate limit restarts for the same streamer/quality (e.g., 10 seconds)
+        # Rate limit restarts
         if (
-            time.time() - last_restart_time < 10
+            time.time() - last_restart_time < 5
             and current_streamer == streamer_name
             and current_quality == desired_quality
             and current_qscale == desired_qscale
@@ -195,8 +195,7 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             return
 
         # Stop existing process
-        if current_process:
-            stop_stream_processing()
+        stop_stream_processing()
             
         current_streamer = streamer_name
         current_quality = desired_quality
@@ -210,7 +209,6 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             streams = session.streams(f"twitch.tv/{streamer_name}")
             if not streams:
                 print(f"No streams found for {streamer_name}")
-                # Don't unset current_streamer, so we can retry later via frame()
                 return
             
             quality_used, stream_obj = pick_stream(streams, desired_quality)
@@ -219,25 +217,18 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 return
             stream_url = stream_obj.url
             current_quality = quality_used
-            current_qscale = desired_qscale
-            current_fps = desired_fps
             
-            # Start ffmpeg
-            # -i <url>: Input
-            # -vf "fps=1,format=gray": 1 frame per second, grayscale
-            # -y: Overwrite output
-            # -update 1: Continously update the image file
-            #
-            # IMPORTANT: avoid aggressive downscaling; it makes on-screen text blurry.
+            # Construct ffmpeg filters
             vf_parts = [f"fps={desired_fps}"]
+            
+            # Rotation
             if FRAME_ROTATE in ("cw", "clockwise", "90"):
                 vf_parts.append("transpose=1")
             elif FRAME_ROTATE in ("ccw", "counterclockwise", "counter-clockwise", "-90", "270"):
                 vf_parts.append("transpose=2")
 
+            # Scaling
             if FRAME_WIDTH > 0 and FRAME_HEIGHT > 0:
-                # Fit within the Kobo's portrait canvas (or your configured canvas).
-                # If rotated, this makes sideways-holding the device effectively "landscape".
                 vf_parts.append(
                     f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
                 )
@@ -245,24 +236,26 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                     f"pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=white"
                 )
             elif FRAME_WIDTH > 0:
-                # Fallback: scale to width, preserve aspect.
                 vf_parts.append(f"scale={FRAME_WIDTH}:-2:flags=lanczos")
 
-            # Kobo is grayscale; force grayscale output.
+            # Format and Enhance for E-ink
             vf_parts.append("format=gray")
+            vf_parts.append("eq=contrast=1.15:saturation=1.0") # Boost contrast slightly for visibility
+            vf_parts.append("unsharp=5:5:1.0:5:5:0.0") # Sharpen to make details clearer
             vf_parts.append("setsar=1")
+            
             vf = ",".join(vf_parts)
+            
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "error",
                 "-y",
-                "-analyzeduration", "0",
-                "-probesize", "32k",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-rtbufsize", "16M",
-                "-re", # Read input at native frame rate (important for live streams)
+                "-reconnect", "1",           # Reconnect on network failure
+                "-reconnect_streamed", "1",  # Reconnect even for streamed data
+                "-reconnect_delay_max", "5", # Max delay for reconnect
+                "-analyzeduration", "10000000",
+                "-probesize", "10000000",
                 "-i", stream_url,
                 "-vf", vf,
                 "-q:v", str(desired_qscale),
@@ -275,11 +268,10 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
             
             # Run in background
             current_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"Started ffmpeg for {streamer_name}")
+            print(f"Started ffmpeg for {streamer_name} at {current_quality}")
             
         except Exception as e:
             print(f"Error starting stream: {e}")
-            # Keep current_streamer set to allow retries
         finally:
             try:
                 session.http.close()
@@ -300,15 +292,48 @@ def stop_stream_processing():
     current_qscale = None
     current_fps = None
 
+def check_stale_stream():
+    """Checks if the frame or process is dead and restarts if needed."""
+    global current_streamer, current_process
+    if not current_streamer:
+        return
+
+    # If process died
+    if current_process and current_process.poll() is not None:
+        print("FFmpeg process died. Restarting...")
+        threading.Thread(
+            target=start_stream_processing, 
+            args=(current_streamer, current_quality, current_qscale, current_fps)
+        ).start()
+        return
+
+    # If file is stale (ffmpeg hung)
+    if os.path.exists(FRAME_PATH):
+        age = time.time() - os.path.getmtime(FRAME_PATH)
+        if age > 10: # No new frame for 10 seconds
+            print(f"Frame is stale ({age:.1f}s). Restarting...")
+            threading.Thread(
+                target=start_stream_processing, 
+                args=(current_streamer, current_quality, current_qscale, current_fps)
+            ).start()
+    else:
+        # File doesn't exist but we think we are streaming?
+        if current_process and (time.time() - last_restart_time > 15):
+             print("Frame file missing. Restarting...")
+             threading.Thread(
+                target=start_stream_processing, 
+                args=(current_streamer, current_quality, current_qscale, current_fps)
+            ).start()
+
 def mjpeg_generator():
     """
     Stream the latest JPEG as a multipart/x-mixed-replace stream.
-    This makes the Kobo browser render near-realtime frames without 1s polling.
     """
     boundary = b"--frame"
-    min_interval = max(0.05, 1.0 / max(1.0, FRAME_FPS * 1.5))  # slightly faster than ffmpeg fps
+    min_interval = max(0.05, 1.0 / max(1.0, FRAME_FPS * 1.5)) 
     while True:
         try:
+            check_stale_stream()
             if os.path.exists(FRAME_PATH):
                 with open(FRAME_PATH, "rb") as f:
                     data = f.read()
@@ -385,15 +410,30 @@ VIEW_HTML = """
         .hint { font-size: 0.9em; color: #444; padding: 8px; }
     </style>
     <script>
-        // Minimal JS loop: just replace the image src with a cache-busted URL.
         {% if autoplay %}
-        (function loop() {
-            var img = document.getElementById('stream-frame');
-            if (img) {
-                img.src = '/frame.jpg?t=' + Date.now();
-            }
-            setTimeout(loop, {{ refresh_ms }});
-        })();
+        function loadNext() {
+            var displayImg = document.getElementById('stream-frame');
+            if (!displayImg) return;
+            
+            var temp = new Image();
+            temp.onload = function() {
+                displayImg.src = temp.src;
+                // Schedule next load after this one completes
+                setTimeout(loadNext, {{ refresh_ms }});
+            };
+            temp.onerror = function() {
+                // If error, wait and retry
+                console.log("Error loading frame");
+                setTimeout(loadNext, {{ refresh_ms }});
+            };
+            // Use timestamp to bust cache
+            temp.src = '/frame.jpg?t=' + Date.now();
+        }
+        
+        window.onload = function() {
+            // Start the loop
+            loadNext();
+        };
         {% endif %}
     </script>
 </head>
@@ -517,15 +557,8 @@ def view(streamer):
 
 @app.route('/frame.jpg')
 def frame():
-    # Check if stream process is alive; if not and we have a target, try to restart
-    global current_process, current_streamer
-    if current_streamer and (not current_process or current_process.poll() is not None):
-        # Trigger restart in background to avoid blocking request? 
-        # Or just do it here (it's fast enough to spawn)
-        # We need to run it in a thread to not block the request?
-        # start_stream_processing handles rate limiting.
-        threading.Thread(target=start_stream_processing, args=(current_streamer,)).start()
-
+    check_stale_stream()
+    
     # If the file exists, serve it.
     if os.path.exists(FRAME_PATH):
         resp = send_file(FRAME_PATH, mimetype='image/jpeg')
@@ -535,10 +568,6 @@ def frame():
         resp.headers["Expires"] = "0"
         return resp
     else:
-        # Return a placeholder or 404
-        # Create a simple placeholder if it doesn't exist
-        # For now, just return 404 or a "Loading" text image?
-        # A 404 might trigger the onerror in JS
         return "Loading...", 404
 
 @app.route('/health')
@@ -547,11 +576,9 @@ def health():
 
 @app.route('/stream.mjpg')
 def stream_mjpg():
-    # Ensure a stream is running; if not, trigger restart in background
-    global current_process, current_streamer
-    if current_streamer and (not current_process or current_process.poll() is not None):
-        threading.Thread(target=start_stream_processing, args=(current_streamer, current_quality, current_qscale, current_fps)).start()
-
+    # Ensure a stream is running
+    check_stale_stream()
+    
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
