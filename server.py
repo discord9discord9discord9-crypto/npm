@@ -397,9 +397,15 @@ VIEW_HTML = """
 <head>
     <title>{{ streamer }}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
+    
+    <!-- No-JS Fallback -->
+    <noscript>
+        <meta http-equiv="refresh" content="{{ refresh_seconds }};url={{ request.url }}">
+    </noscript>
+
     <style>
         body { margin: 0; padding: 0; background: #fff; text-align: center; height: 100vh; display: flex; flex-direction: column; }
         #stream-container { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
@@ -408,39 +414,81 @@ VIEW_HTML = """
         a { text-decoration: none; color: #000; border: 1px solid #000; padding: 5px 15px; }
         select { padding: 5px; margin-right: 10px; }
         .hint { font-size: 0.9em; color: #444; padding: 8px; }
+        
+        /* Kobo optimizations */
+        {% if is_kobo %}
+        body { font-family: monospace; }
+        .controls { padding: 5px; }
+        img { image-rendering: pixelated; }
+        {% endif %}
     </style>
     <script>
         {% if autoplay %}
-        function loadNext() {
-            var displayImg = document.getElementById('stream-frame');
-            if (!displayImg) return;
+        (function() {
+            var refreshMs = {{ refresh_ms }};
+            var isKobo = {{ is_kobo|tojson }};
+            var displayImg = null;
+            var loading = false;
+            var loadTimeout = null;
             
-            var temp = new Image();
-            temp.onload = function() {
-                displayImg.src = temp.src;
-                // Schedule next load after this one completes
-                setTimeout(loadNext, {{ refresh_ms }});
+            function updateImage() {
+                if (loading) return;
+                loading = true;
+                
+                var temp = new Image();
+                var unique = Date.now();
+                
+                loadTimeout = setTimeout(function() {
+                    console.warn("Image load timed out");
+                    cleanup();
+                    scheduleNext(); 
+                }, 10000);
+                
+                temp.onload = function() {
+                    if (!displayImg) displayImg = document.getElementById('stream-frame');
+                    if (displayImg) {
+                        displayImg.src = temp.src;
+                    }
+                    cleanup();
+                    scheduleNext();
+                };
+                
+                temp.onerror = function() {
+                    console.error("Image load failed");
+                    cleanup();
+                    scheduleNext();
+                };
+                
+                temp.src = '/frame.jpg?t=' + unique;
+                
+                function cleanup() {
+                    loading = false;
+                    if (loadTimeout) {
+                        clearTimeout(loadTimeout);
+                        loadTimeout = null;
+                    }
+                    temp.onload = null;
+                    temp.onerror = null;
+                    temp.src = '';
+                }
+            }
+            
+            function scheduleNext() {
+                setTimeout(updateImage, refreshMs);
+            }
+            
+            window.onload = function() {
+                displayImg = document.getElementById('stream-frame');
+                updateImage();
             };
-            temp.onerror = function() {
-                // If error, wait and retry
-                console.log("Error loading frame");
-                setTimeout(loadNext, {{ refresh_ms }});
-            };
-            // Use timestamp to bust cache
-            temp.src = '/frame.jpg?t=' + Date.now();
-        }
-        
-        window.onload = function() {
-            // Start the loop
-            loadNext();
-        };
+        })();
         {% endif %}
     </script>
 </head>
 <body>
     <div id="stream-container">
         {% if autoplay %}
-        <img id="stream-frame" src="/frame.jpg" alt="Stream Loading...">
+        <img id="stream-frame" src="/frame.jpg?t={{ now }}" alt="Stream">
         {% else %}
         <div class="hint">Select a quality below to start streaming.</div>
         {% endif %}
@@ -475,6 +523,7 @@ VIEW_HTML = """
         </form>
         <a href="/">Back to List</a>
         <span>{{ streamer }}</span>
+        {% if is_kobo %}<span style="font-size:0.8em">[Kobo Mode]</span>{% endif %}
     </div>
 </body>
 </html>
@@ -491,6 +540,10 @@ def view(streamer):
     requested_quality = request.args.get("quality")
     requested_imgq = request.args.get("imgq", type=int)
     requested_fps = request.args.get("fps", type=float)
+    
+    # Kobo detection
+    is_kobo = "Kobo" in request.headers.get("User-Agent", "")
+
     qualities = get_stream_qualities(streamer)
 
     # Always include the configured default and common fallbacks, and dedupe.
@@ -509,7 +562,12 @@ def view(streamer):
 
     selected_quality = requested_quality or (qualities[0] if qualities else TWITCH_STREAM_QUALITY)
     selected_imgq = requested_imgq or FRAME_JPEG_QSCALE
-    selected_fps = requested_fps or FRAME_FPS
+    
+    # Cap FPS for Kobo if not specified
+    if is_kobo and requested_fps is None:
+        selected_fps = 1.0
+    else:
+        selected_fps = requested_fps or FRAME_FPS
 
     image_quality_options = [
         (1, "HQ (q=1)"),
@@ -529,7 +587,11 @@ def view(streamer):
     # Clamp refresh interval for Kobo e-ink; tie it loosely to selected fps.
     refresh_ms = request.args.get("refresh_ms", type=int)
     if refresh_ms is None:
-        refresh_ms = int(max(300, min(4000, 1000.0 / max(0.1, selected_fps))))
+        if is_kobo:
+             # Slower refresh for Kobo to avoid overlap
+             refresh_ms = 1500 if selected_fps <= 1.0 else int(1000.0 / selected_fps)
+        else:
+            refresh_ms = int(max(300, min(4000, 1000.0 / max(0.1, selected_fps))))
 
     # Start processing only after the user has picked a quality
     autoplay = requested_quality is not None
@@ -547,6 +609,9 @@ def view(streamer):
             fps_options=fps_options,
             selected_fps=selected_fps,
             refresh_ms=refresh_ms,
+            refresh_seconds=refresh_ms / 1000.0,
+            is_kobo=is_kobo,
+            now=time.time(),
             autoplay=autoplay,
         )
     )
