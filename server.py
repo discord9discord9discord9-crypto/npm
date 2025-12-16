@@ -5,6 +5,8 @@ import threading
 import requests
 import signal
 import math
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, Response, request, render_template_string, send_file, make_response
 from streamlink import Streamlink
 from dotenv import load_dotenv
@@ -39,6 +41,11 @@ BANDWIDTH_PRESET = os.environ.get("BANDWIDTH_PRESET", "balanced").strip().lower(
 FRAME_STALE_SECONDS = float(os.environ.get("FRAME_STALE_SECONDS", "12"))
 PORT = int(os.environ.get("PORT", 5000))
 
+# Network tuning (important for slow/unreliable internet)
+HTTP_CONNECT_TIMEOUT = float(os.environ.get("HTTP_CONNECT_TIMEOUT", "3.0"))
+HTTP_READ_TIMEOUT = float(os.environ.get("HTTP_READ_TIMEOUT", "8.0"))
+HTTP_RETRIES = int(os.environ.get("HTTP_RETRIES", "2"))
+
 # Global State
 current_process = None
 current_streamer = None
@@ -55,6 +62,28 @@ PLACEHOLDER_PATH = "placeholder.jpg"
 _STREAMS_CACHE = {"ts": 0.0, "category": None, "data": []}
 _QUALITIES_CACHE = {}  # streamer -> {"ts": float, "data": [qualities]}
 
+def _build_requests_session() -> requests.Session:
+    """
+    Requests session with conservative retries/backoff for flaky links.
+    Keeps connections alive (faster) and avoids hanging forever (timeouts).
+    """
+    s = requests.Session()
+    retry = Retry(
+        total=max(0, HTTP_RETRIES),
+        connect=max(0, HTTP_RETRIES),
+        read=max(0, HTTP_RETRIES),
+        status=max(0, HTTP_RETRIES),
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "kobo-twitch/1.0"})
+    return s
+
 # Twitch API Helper
 class TwitchAPI:
     def __init__(self, client_id, client_secret):
@@ -62,21 +91,29 @@ class TwitchAPI:
         self.client_secret = client_secret
         self.token = None
         self.token_expiry = 0
+        self.session = _build_requests_session()
 
     def get_token(self):
         if self.token and time.time() < self.token_expiry:
             return self.token
         
         url = "https://id.twitch.tv/oauth2/token"
-        params = {
+        data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "grant_type": "client_credentials"
         }
         try:
-            resp = requests.post(url, params=params).json()
-            self.token = resp["access_token"]
-            self.token_expiry = time.time() + resp["expires_in"] - 60
+            r = self.session.post(
+                url,
+                data=data,
+                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+            )
+            payload = r.json() if r is not None else {}
+            if r is None or r.status_code >= 400:
+                raise RuntimeError(f"token request failed ({getattr(r, 'status_code', 'n/a')}): {payload}")
+            self.token = payload["access_token"]
+            self.token_expiry = time.time() + int(payload.get("expires_in", 0)) - 60
             return self.token
         except Exception as e:
             print(f"Error getting token: {e}")
@@ -94,9 +131,17 @@ class TwitchAPI:
         params = {"name": game_name}
         
         try:
-            resp = requests.get(url, headers=headers, params=params).json()
-            if resp.get("data"):
-                return resp["data"][0]["id"]
+            r = self.session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+            )
+            payload = r.json() if r is not None else {}
+            if r is None or r.status_code >= 400:
+                raise RuntimeError(f"games lookup failed ({getattr(r, 'status_code', 'n/a')}): {payload}")
+            if payload.get("data"):
+                return payload["data"][0]["id"]
         except Exception as e:
             print(f"Error getting game ID: {e}")
         return None
@@ -115,8 +160,16 @@ class TwitchAPI:
         params = {"game_id": game_id, "first": 20}
         
         try:
-            resp = requests.get(url, headers=headers, params=params).json()
-            return resp.get("data", [])
+            r = self.session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+            )
+            payload = r.json() if r is not None else {}
+            if r is None or r.status_code >= 400:
+                raise RuntimeError(f"streams lookup failed ({getattr(r, 'status_code', 'n/a')}): {payload}")
+            return payload.get("data", [])
         except Exception as e:
             print(f"Error getting streams: {e}")
             return []
@@ -195,6 +248,19 @@ def _frame_is_stale(path: str, stale_seconds: float) -> bool:
         return False
     age = time.time() - st.st_mtime
     return age > stale_seconds
+
+def _frame_etag_and_mtime(path: str):
+    """
+    ETag based on file mtime+size (fast) for conditional requests.
+    Returns (etag, mtime_float) or (None, None).
+    """
+    try:
+        st = os.stat(path)
+    except Exception:
+        return None, None
+    # Return the *unquoted* tag; Werkzeug will quote and apply weakness.
+    etag = f"{int(st.st_mtime_ns):x}-{int(st.st_size):x}"
+    return etag, st.st_mtime
 
 def cached_get_streams(category: str, ttl_seconds: float = 30.0):
     now = time.time()
@@ -523,6 +589,7 @@ VIEW_HTML = """
 
             var loading = false;
             var watchdog = null;
+            var toggle = 0;
 
             function scheduleNext(delay) {
                 window.setTimeout(kick, delay);
@@ -532,8 +599,10 @@ VIEW_HTML = """
                 if (!img) return;
                 if (loading) return; // wait for onload/onerror
                 loading = true;
-                var ts = Date.now();
-                img.src = '/frame.jpg?t=' + ts;
+                // Keep URL mostly stable so the browser can revalidate with ETag (304).
+                // Toggle between two URLs to ensure the <img> reloads even if src repeats.
+                toggle = 1 - toggle;
+                img.src = '/frame.jpg?v=' + toggle;
 
                 // If the request hangs forever, force a retry.
                 if (watchdog) window.clearTimeout(watchdog);
@@ -565,7 +634,7 @@ VIEW_HTML = """
             {% if mode == 'mjpg' %}
             <img id="stream-frame" src="/stream.mjpg" alt="Stream Loading...">
             {% else %}
-            <img id="stream-frame" src="/frame.jpg" alt="Stream Loading...">
+            <img id="stream-frame" src="/frame.jpg?v=0" alt="Stream Loading...">
             {% endif %}
         {% else %}
         <div class="hint">Select a quality below to start streaming.</div>
@@ -747,21 +816,29 @@ def frame():
                 daemon=True,
             ).start()
 
-    # If the file exists, serve it.
+    # If the file exists, serve it with conditional request support (ETag/304).
     if os.path.exists(FRAME_PATH):
-        resp = send_file(FRAME_PATH, mimetype='image/jpeg')
-        # Kobo / embedded browsers can be aggressive about caching; force a fresh fetch.
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        etag, mtime = _frame_etag_and_mtime(FRAME_PATH)
+        resp = send_file(FRAME_PATH, mimetype="image/jpeg", conditional=False, etag=False, last_modified=mtime)
+        if etag:
+            resp.set_etag(etag, weak=True)
+            # Apply conditional logic *after* setting ETag/Last-Modified.
+            resp.make_conditional(request)
+        # Allow caching but force revalidation. This enables 304s (huge win on slow links).
+        resp.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
-        # Some proxies buffer responses; reduce latency for frame fetches.
         resp.headers["X-Accel-Buffering"] = "no"
         return resp
     else:
         _ensure_placeholder()
         if os.path.exists(PLACEHOLDER_PATH):
-            resp = send_file(PLACEHOLDER_PATH, mimetype="image/jpeg")
-            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            etag, mtime = _frame_etag_and_mtime(PLACEHOLDER_PATH)
+            resp = send_file(PLACEHOLDER_PATH, mimetype="image/jpeg", conditional=False, etag=False, last_modified=mtime)
+            if etag:
+                resp.set_etag(etag, weak=True)
+                resp.make_conditional(request)
+            resp.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
             resp.headers["Pragma"] = "no-cache"
             resp.headers["Expires"] = "0"
             resp.headers["X-Accel-Buffering"] = "no"
