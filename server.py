@@ -5,7 +5,7 @@ import threading
 import requests
 import signal
 import math
-from flask import Flask, Response, request, render_template_string, redirect, url_for, send_file, make_response
+from flask import Flask, Response, request, render_template_string, send_file, make_response
 from streamlink import Streamlink
 from dotenv import load_dotenv
 
@@ -35,6 +35,8 @@ FRAME_JPEG_QSCALE = int(os.environ.get("FRAME_JPEG_QSCALE", "2"))
 # Default viewer preset: "low", "balanced", or "hq".
 # Default to balanced so Kobo readability stays high by default.
 BANDWIDTH_PRESET = os.environ.get("BANDWIDTH_PRESET", "balanced").strip().lower()
+# If ffmpeg stalls but doesn't exit, restart when the frame file stops updating.
+FRAME_STALE_SECONDS = float(os.environ.get("FRAME_STALE_SECONDS", "12"))
 PORT = int(os.environ.get("PORT", 5000))
 
 # Global State
@@ -143,6 +145,56 @@ def _preset_defaults(preset: str):
     # Important for Kobo: avoid downscaling by default (it makes text/UI blurry).
     # Save bandwidth primarily via fewer frames + lower stream rendition.
     return {"quality": "worst", "imgq": 4, "fps": 0.5, "scale": 1.0, "mode": "poll"}
+
+
+def _ensure_placeholder():
+    """
+    Create a simple placeholder JPEG so the Kobo always receives a valid image.
+    Using ffmpeg keeps deps minimal (no Pillow).
+    """
+    if os.path.exists(PLACEHOLDER_PATH):
+        return
+    try:
+        # Plain white placeholder, sized to the configured frame canvas.
+        w = max(64, int(FRAME_WIDTH) if FRAME_WIDTH > 0 else 1404)
+        h = max(64, int(FRAME_HEIGHT) if FRAME_HEIGHT > 0 else 1872)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=white:s={w}x{h}:r=1",
+                "-frames:v",
+                "1",
+                "-vf",
+                "format=gray",
+                "-q:v",
+                "6",
+                PLACEHOLDER_PATH,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # If placeholder creation fails, we'll fall back to 404.
+        pass
+
+
+def _frame_is_stale(path: str, stale_seconds: float) -> bool:
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+    age = time.time() - st.st_mtime
+    return age > stale_seconds
 
 def cached_get_streams(category: str, ttl_seconds: float = 30.0):
     now = time.time()
@@ -333,6 +385,9 @@ def start_stream_processing(streamer_name, preferred_quality=None, image_qscale=
                 "-map_metadata", "-1",
                 "-vsync", "0",
                 "-flush_packets", "1",
+                # Prevent partially-written JPEG reads (atomic temp + rename)
+                "-f", "image2",
+                "-atomic_writing", "1",
                 "-update", "1",
                 FRAME_PATH
             ]
@@ -372,18 +427,25 @@ def mjpeg_generator():
     """
     boundary = b"--frame"
     min_interval = max(0.05, 1.0 / max(1.0, FRAME_FPS * 1.5))  # slightly faster than ffmpeg fps
+    last_mtime = 0.0
     while True:
         try:
             if os.path.exists(FRAME_PATH):
-                with open(FRAME_PATH, "rb") as f:
-                    data = f.read()
-                if data:
-                    yield boundary + b"\r\n"
-                    yield b"Content-Type: image/jpeg\r\n"
-                    yield b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
-                    yield b"Pragma: no-cache\r\n"
-                    yield f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
-                    yield data + b"\r\n"
+                try:
+                    mtime = os.path.getmtime(FRAME_PATH)
+                except Exception:
+                    mtime = 0.0
+                if mtime > last_mtime:
+                    last_mtime = mtime
+                    with open(FRAME_PATH, "rb") as f:
+                        data = f.read()
+                    if data:
+                        yield boundary + b"\r\n"
+                        yield b"Content-Type: image/jpeg\r\n"
+                        yield b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                        yield b"Pragma: no-cache\r\n"
+                        yield f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
+                        yield data + b"\r\n"
             time.sleep(min_interval)
         except GeneratorExit:
             break
@@ -450,14 +512,49 @@ VIEW_HTML = """
         .hint { font-size: 0.9em; color: #444; padding: 8px; }
     </style>
     <script>
-        // Minimal JS loop: just replace the image src with a cache-busted URL.
+        // Slow-link safe loop:
+        // Only request the next frame AFTER the current one finishes downloading.
+        // This prevents canceling in-flight downloads (common cause of "stuck on one frame").
         {% if autoplay and mode == 'poll' %}
-        (function loop() {
+        (function () {
+            var refreshMs = {{ refresh_ms }};
             var img = document.getElementById('stream-frame');
-            if (img) {
-                img.src = '/frame.jpg?t=' + Date.now();
+            if (!img) return;
+
+            var loading = false;
+            var watchdog = null;
+
+            function scheduleNext(delay) {
+                window.setTimeout(kick, delay);
             }
-            setTimeout(loop, {{ refresh_ms }});
+
+            function kick() {
+                if (!img) return;
+                if (loading) return; // wait for onload/onerror
+                loading = true;
+                var ts = Date.now();
+                img.src = '/frame.jpg?t=' + ts;
+
+                // If the request hangs forever, force a retry.
+                if (watchdog) window.clearTimeout(watchdog);
+                watchdog = window.setTimeout(function () {
+                    if (loading) {
+                        loading = false;
+                        scheduleNext(0);
+                    }
+                }, Math.max(20000, refreshMs * 6));
+            }
+
+            img.onload = function () {
+                loading = false;
+                scheduleNext(refreshMs);
+            };
+            img.onerror = function () {
+                loading = false;
+                scheduleNext(Math.min(2000, refreshMs));
+            };
+
+            scheduleNext(0);
         })();
         {% endif %}
     </script>
@@ -638,14 +735,17 @@ def view(streamer):
 
 @app.route('/frame.jpg')
 def frame():
-    # Check if stream process is alive; if not and we have a target, try to restart
-    global current_process, current_streamer
-    if current_streamer and (not current_process or current_process.poll() is not None):
-        # Trigger restart in background to avoid blocking request? 
-        # Or just do it here (it's fast enough to spawn)
-        # We need to run it in a thread to not block the request?
-        # start_stream_processing handles rate limiting.
-        threading.Thread(target=start_stream_processing, args=(current_streamer,)).start()
+    # Check if stream process is alive or frames are stale; if so, restart in background.
+    global current_process, current_streamer, current_quality, current_qscale, current_fps, current_scale
+    if current_streamer:
+        dead = (not current_process) or (current_process.poll() is not None)
+        stale = _frame_is_stale(FRAME_PATH, FRAME_STALE_SECONDS)
+        if dead or stale:
+            threading.Thread(
+                target=start_stream_processing,
+                args=(current_streamer, current_quality, current_qscale, current_fps, current_scale),
+                daemon=True,
+            ).start()
 
     # If the file exists, serve it.
     if os.path.exists(FRAME_PATH):
@@ -654,12 +754,18 @@ def frame():
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
+        # Some proxies buffer responses; reduce latency for frame fetches.
+        resp.headers["X-Accel-Buffering"] = "no"
         return resp
     else:
-        # Return a placeholder or 404
-        # Create a simple placeholder if it doesn't exist
-        # For now, just return 404 or a "Loading" text image?
-        # A 404 might trigger the onerror in JS
+        _ensure_placeholder()
+        if os.path.exists(PLACEHOLDER_PATH):
+            resp = send_file(PLACEHOLDER_PATH, mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+            resp.headers["X-Accel-Buffering"] = "no"
+            return resp
         return "Loading...", 404
 
 @app.route('/health')
